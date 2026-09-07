@@ -70,6 +70,7 @@ def prepare_main_dataset(fifa_df, stats_df=None):
         "age",
         "overall",
         "potential",
+        "value_eur",
         "player_positions",
         "club_name",
         "nationality_name",
@@ -196,6 +197,37 @@ def validate_valuation_analysis(fifa_df, stats_df, min_minutes=900):
         threshold_result = build_valuation_analysis(fifa, stats, min_minutes=threshold)
         sensitivity[threshold] = len(threshold_result)
     report["comparison_count_by_minutes"] = sensitivity
+
+    if not comparison.empty and "value_eur" in comparison.columns:
+        comparison["value_eur"] = pd.to_numeric(comparison["value_eur"], errors="coerce")
+        comparison["market_value_percentile"] = comparison.groupby(
+            "position_group_fifa"
+        )["value_eur"].rank(pct=True)
+        comparison["market_value_gap"] = (
+            comparison["market_value_percentile"] - comparison["rating_percentile"]
+        )
+        market_check = comparison[["valuation_gap", "market_value_gap"]].dropna()
+        report["market_value_validation"] = {
+            "spearman_correlation": round(
+                market_check["valuation_gap"].corr(
+                    market_check["market_value_gap"], method="spearman"
+                ),
+                3,
+            ) if len(market_check) > 1 else None,
+            "players_with_positive_market_gap": int(
+                (market_check["market_value_gap"] > 0).sum()
+            ),
+            "players_checked": len(market_check),
+        }
+
+    base = build_valuation_analysis(fifa, stats, min_minutes=900)
+    for threshold in (600, 1200):
+        alternate = build_valuation_analysis(fifa, stats, min_minutes=threshold)
+        base_top = set(base.head(10)["name_clean"])
+        alternate_top = set(alternate.head(10)["name_clean"])
+        report[f"underrated_top_10_overlap_{threshold}_vs_900"] = len(
+            base_top & alternate_top
+        )
 
     return report
 
