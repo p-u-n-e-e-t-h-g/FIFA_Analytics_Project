@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+
+# Keep CSVs out of git unless you want them tracked
+# Uncomment if you want to track CSVs
+# data/*.csv
