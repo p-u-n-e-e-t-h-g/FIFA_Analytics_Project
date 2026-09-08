@@ -236,8 +236,17 @@ def match_players(fifa_main, stats):
     return stats
 
 
-def build_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAULT):
-    """Compare FIFA ratings with position-adjusted real-world production."""
+def build_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAULT, include_needs_review=False):
+    """Compare FIFA ratings with position-adjusted real-world production.
+
+    By default, matches flagged by match_players() as needing manual review
+    (low-confidence fuzzy matches, name collisions) are excluded from the
+    returned rankings -- a flagged match can be a genuinely wrong join (see
+    e.g. 'Jon Martin' matched to 'Martin Gjone' at ~91% fuzzy similarity),
+    and letting those into headline "underrated"/"overrated" rankings risks
+    reporting noise as signal. Pass include_needs_review=True to get the
+    full unfiltered set (useful for auditing match quality itself).
+    """
     fifa_main = prepare_main_dataset(fifa_df)
     stats = prepare_stats_dataset(stats_df, min_minutes=min_minutes)
     if stats.empty:
@@ -265,7 +274,12 @@ def build_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAULT)
         else "overrated" if gap <= -VALUATION_GAP_THRESHOLD
         else "aligned"
     )
-    return comparison.sort_values("valuation_gap", ascending=False)
+    comparison = comparison.sort_values("valuation_gap", ascending=False)
+
+    if not include_needs_review:
+        comparison = comparison[~comparison["needs_review"]].copy()
+
+    return comparison
 
 
 def validate_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAULT):
@@ -311,7 +325,9 @@ def validate_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAU
         comparison["market_value_gap"] = (
             comparison["market_value_percentile"] - comparison["rating_percentile"]
         )
-        market_check = comparison[["valuation_gap", "market_value_gap"]].dropna()
+        market_check = comparison[
+            ["position_group_fifa", "valuation_gap", "market_value_gap"]
+        ].dropna()
         report["market_value_validation"] = {
             "spearman_correlation": round(
                 market_check["valuation_gap"].corr(
@@ -320,6 +336,18 @@ def validate_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAU
             ) if len(market_check) > 1 else None,
             "players_checked": len(market_check),
         }
+
+        by_position = {}
+        for group, group_df in market_check.groupby("position_group_fifa"):
+            by_position[group] = {
+                "spearman_correlation": round(
+                    group_df["valuation_gap"].corr(
+                        group_df["market_value_gap"], method="spearman"
+                    ), 3,
+                ) if len(group_df) > 1 else None,
+                "players_checked": len(group_df),
+            }
+        report["market_value_validation_by_position"] = by_position
 
     sensitivity = {}
     for threshold in (600, 900, 1200):
@@ -346,7 +374,11 @@ def run_project_analysis():
     print("FIFA main shape:", fifa_main.shape)
 
     if stats_df is not None:
+        # Headline rankings exclude low-confidence/ambiguous matches by default.
         comparison = build_valuation_analysis(fifa_df, stats_df)
+        # Full set (incl. flagged matches) so we can show what was excluded and why.
+        comparison_all = build_valuation_analysis(fifa_df, stats_df, include_needs_review=True)
+
         validation = validate_valuation_analysis(fifa_df, stats_df)
         print("\nValidation report:")
         for k, v in validation.items():
@@ -362,8 +394,8 @@ def run_project_analysis():
             ["player", "position_group_fifa", "overall", "performance_percentile", "valuation_gap", "match_type"]
         ].tail(10).sort_values("valuation_gap").to_string(index=False))
 
-        print("\nMatches flagged for manual review (fuzzy/collisions):")
-        review_rows = comparison[comparison["needs_review"]]
+        print("\nMatches excluded from rankings above (flagged for manual review -- fuzzy/collisions):")
+        review_rows = comparison_all[comparison_all["needs_review"]]
         if not review_rows.empty:
             print(review_rows[["player", "long_name", "match_type", "match_score"]].to_string(index=False))
         else:
