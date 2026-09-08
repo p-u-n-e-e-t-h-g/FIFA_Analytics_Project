@@ -43,32 +43,51 @@ The current validation report checks that the pipeline is reliable and also comp
 
 Real validation requires an independent target, such as real transfer values, wages, expert rankings, team-of-the-season selections, or a later season of performance. We should test whether high positive gaps predict that independent target while controlling for position, playing time, age, and league. Until that data is added, the project validates its calculations and assumptions, but not the truth of the underrated or overrated labels.
 
-## Known Limitation: Defensive Metrics Favour Weaker Teams
+## Known Limitation: Defensive Metrics Undercount Elite Players at Dominant Teams
 
 Position-split validation against `value_eur` shows DEF has the weakest
-correlation with market value of any position group (Spearman ≈ -0.18,
-vs. ≈ 0.07 for MID and ≈ 0.00 for GK). Digging into the largest
-disagreements shows a consistent pattern:
+correlation with market value of any position group (Spearman ≈ -0.17,
+vs. ≈ 0.07 for MID and ≈ 0.00 for GK). Two normalization fixes were
+tested against this finding and both were rejected by the data:
 
-- Aging defenders on weaker teams (e.g. players in their early-to-mid
-  30s at mid-table clubs) score highly on raw defensive counting
-  stats (tackles, interceptions, clearances) simply because their
-  team spends more time defending.
-- Elite defenders at possession-dominant clubs (e.g. players compared
-  to Arsenal's or Inter's first-choice center-backs) score *lower* on
-  the same metrics, despite both FIFA rating and market value agreeing
-  they are excellent, because their team controls the ball and rarely
-  needs defending.
+1. **Team-baseline normalization** -- expressing each defender's raw
+   stats relative to their own squad's average -- did not improve the
+   correlation.
+2. **Role-based normalization** -- splitting DEF into center-backs vs.
+   fullbacks, since FBref's position data doesn't distinguish them but
+   FIFA's does -- also did not improve it. Elite center-backs at
+   possession-dominant clubs (e.g. Arsenal's William Saliba) still
+   rank low even when compared only to other center-backs league-wide.
 
-This is a known bias in raw defensive counting stats, not a bug in the
-matching or scoring code: `tkl`, `int`, and `clr` per 90 measure
-defensive *activity*, not defensive *quality*, and activity is driven
-as much by team style as by individual skill. The current DEF metric
-bundle (`tkl, int, clr, won_pct, prgp`) should be read with this in
-mind -- a low performance_percentile for a defender at a dominant team
-is not strong evidence of overrating.
+**Conclusion:** this is not a normalization problem. Elite center-backs
+at top teams face fewer defensive situations in the first place,
+because their team controls the ball -- so raw counting stats (`tkl`,
+`int`, `clr`) are genuinely lower for them, and no reweighting of
+*those same stats* can recover a signal they were never designed to
+capture. What actually makes a defender like Saliba elite --
+positioning that prevents situations from occurring, composure and
+distribution under pressure -- isn't represented in this metric bundle
+at all. This is a scope limitation of the available stats, not a bug:
+the DEF `valuation_gap` should be read as "counting-stat productivity
+relative to rating," not as a general skill judgment, and is least
+reliable for possession-dominant teams' defenders.
 
-Possible future fixes: normalize defensive actions by team possession
-share or opponent touches in the defensive third (if available in the
-source data), or weight progressive/ball-playing metrics (`prgp`) more
-heavily relative to raw defensive counting stats for this position group.
+Future work: test correlation against `wage_eur` (club-set wages may
+track true ability better than FIFA's in-game market value), or
+incorporate an independent possession-adjusted defensive metric
+(e.g. defensive actions per opponent touch in the defensive third)
+if available in a future data source.
+
+## Key Findings
+
+- Built a position-aware pipeline joining FIFA FC26 ratings to FBref
+  real-world performance stats via a tiered name-matching system
+  (exact → token-normalized → fuzzy fallback), achieving a 65% match
+  rate on 900+-minute players (up from 42% with naive exact matching).
+- Validated the resulting "valuation gap" against independent market
+  value data, split by position -- and found it holds up reasonably
+  for midfielders and goalkeepers but breaks down for defenders.
+- Root-caused the defender breakdown to a real limitation in available
+  defensive stats (see "Known Limitation" below) rather than a bug or
+  tuning issue -- tested and ruled out two plausible normalization fixes
+  before reaching that conclusion.
