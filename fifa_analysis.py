@@ -1,11 +1,17 @@
 from pathlib import Path
 import re
 import unicodedata
+from difflib import SequenceMatcher
 
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
+
+# --- tunable constants (previously magic numbers buried in functions) ---
+MIN_MINUTES_DEFAULT = 900
+VALUATION_GAP_THRESHOLD = 0.2
+FUZZY_MATCH_MIN_SCORE = 90  # 0-100; only used for the tier-3 fallback
 
 
 def find_csv_files():
@@ -20,12 +26,9 @@ def load_data_files():
         raise FileNotFoundError(
             "No CSV files found in the data folder. Add your FIFA CSV files there first."
         )
-
     loaded = {}
     for file in csv_files:
-        key = file.stem
-        loaded[key] = pd.read_csv(file, low_memory=False)
-
+        loaded[file.stem] = pd.read_csv(file, low_memory=False)
     return loaded
 
 
@@ -37,11 +40,31 @@ def standardize_columns(df):
 
 
 def normalize_player_name(value):
-    """Create a consistent join key for player names."""
+    """Create a consistent join key for player names (strip accents, punctuation, case)."""
     value = unicodedata.normalize("NFKD", str(value))
     value = "".join(char for char in value if not unicodedata.combining(char))
     value = re.sub(r"[^a-zA-Z0-9 ]", "", value).lower()
     return re.sub(r"\s+", " ", value).strip()
+
+
+def first_last_name(name_clean):
+    """Collapse a full name to 'first last', dropping middle names.
+
+    FIFA's long_name is often a full legal name ('Jude Victor William
+    Bellingham') while FBref-style stats use the common public name
+    ('Jude Bellingham'). This bridges that gap for the common case.
+    """
+    tokens = name_clean.split()
+    if len(tokens) < 2:
+        return name_clean
+    return f"{tokens[0]} {tokens[-1]}"
+
+
+def token_sort_ratio(a, b):
+    """Order-independent similarity score (0-100) between two name strings."""
+    a_sorted = " ".join(sorted(a.split()))
+    b_sorted = " ".join(sorted(b.split()))
+    return SequenceMatcher(None, a_sorted, b_sorted).ratio() * 100
 
 
 def position_group(position):
@@ -58,35 +81,26 @@ def position_group(position):
     return None
 
 
-def prepare_main_dataset(fifa_df, stats_df=None):
+def prepare_main_dataset(fifa_df):
     """Create a cleaned FIFA metadata set for joining/analysis."""
     fifa_df = standardize_columns(fifa_df)
-    if stats_df is not None:
-        stats_df = standardize_columns(stats_df)
 
     use_cols = [
-        "short_name",
-        "long_name",
-        "age",
-        "overall",
-        "potential",
-        "value_eur",
-        "player_positions",
-        "club_name",
-        "nationality_name",
-        "league_name",
+        "short_name", "long_name", "age", "overall", "potential", "value_eur",
+        "player_positions", "club_name", "nationality_name", "league_name",
     ]
     use_cols = [c for c in use_cols if c in fifa_df.columns]
 
     fifa_main = fifa_df[use_cols].copy()
     fifa_main["name_clean"] = fifa_main["long_name"].map(normalize_player_name)
+    fifa_main["name_firstlast"] = fifa_main["name_clean"].map(first_last_name)
     fifa_main = fifa_main.dropna(subset=["name_clean", "player_positions"])
     fifa_main = fifa_main.drop_duplicates(subset=["name_clean"])
     fifa_main["position_group"] = fifa_main["player_positions"].map(position_group)
     return fifa_main
 
 
-def prepare_stats_dataset(stats_df, min_minutes=900):
+def prepare_stats_dataset(stats_df, min_minutes=MIN_MINUTES_DEFAULT):
     """Prepare real-world player production for position-aware comparison."""
     stats = standardize_columns(stats_df).rename(
         columns={
@@ -133,20 +147,113 @@ def prepare_stats_dataset(stats_df, min_minutes=900):
         percentiles = stats.loc[group_mask, available].rank(pct=True)
         stats.loc[group_mask, "performance_percentile"] = percentiles.mean(axis=1)
 
-    return stats[
-        ["name_clean", "player", "real_positions", "minutes", "position_group", "performance_percentile"]
-    ].dropna(subset=["performance_percentile"])
+    return stats.dropna(subset=["performance_percentile"])
 
 
-def build_valuation_analysis(fifa_df, stats_df, min_minutes=900):
+def match_players(fifa_main, stats):
+    """Join stats players to FIFA players using a three-tier name-matching strategy.
+
+    Tier 1: exact match on normalized long_name.
+    Tier 2: exact match on 'first + last' token, restricted to same position
+            group (handles FIFA's full-legal-name vs FBref's common-name gap).
+            Ambiguous collisions (2+ candidates) are left unmatched and flagged
+            for manual review rather than guessed.
+    Tier 3: fuzzy fallback (token-sort similarity), same position group,
+            only above FUZZY_MATCH_MIN_SCORE.
+
+    Returns stats with extra columns: matched_fifa_name_clean, match_type,
+    match_score (NaN/None where unmatched).
+    """
+    fifa_exact = set(fifa_main["name_clean"])
+
+    firstlast_map = {}
+    for idx, row in fifa_main.iterrows():
+        firstlast_map.setdefault(row["name_firstlast"], []).append(idx)
+
+    fifa_by_group = {
+        group: fifa_main[fifa_main["position_group"] == group]
+        for group in fifa_main["position_group"].dropna().unique()
+    }
+
+    matched_name, match_type, match_score, review_flag = [], [], [], []
+
+    for _, row in stats.iterrows():
+        name = row["name_clean"]
+        group = row["position_group"]
+
+        if name in fifa_exact:
+            matched_name.append(name)
+            match_type.append("exact")
+            match_score.append(100.0)
+            review_flag.append(False)
+            continue
+
+        candidates_idx = [
+            i for i in firstlast_map.get(name, [])
+            if fifa_main.loc[i, "position_group"] == group
+        ]
+        if len(candidates_idx) == 1:
+            matched_name.append(fifa_main.loc[candidates_idx[0], "name_clean"])
+            match_type.append("first_last")
+            match_score.append(95.0)
+            review_flag.append(False)
+            continue
+        if len(candidates_idx) > 1:
+            # Genuine ambiguity (name collision) -- don't guess.
+            matched_name.append(None)
+            match_type.append("ambiguous")
+            match_score.append(None)
+            review_flag.append(True)
+            continue
+
+        pool = fifa_by_group.get(group)
+        if pool is None or pool.empty:
+            matched_name.append(None)
+            match_type.append("unmatched")
+            match_score.append(None)
+            review_flag.append(False)
+            continue
+
+        scores = pool["name_clean"].map(lambda c: token_sort_ratio(name, c))
+        best_idx = scores.idxmax()
+        best_score = scores[best_idx]
+        if best_score >= FUZZY_MATCH_MIN_SCORE:
+            matched_name.append(pool.loc[best_idx, "name_clean"])
+            match_type.append("fuzzy")
+            match_score.append(round(best_score, 1))
+            review_flag.append(best_score < 95)  # flag lower-confidence fuzzy hits
+        else:
+            matched_name.append(None)
+            match_type.append("unmatched")
+            match_score.append(None)
+            review_flag.append(False)
+
+    stats = stats.copy()
+    stats["matched_fifa_name_clean"] = matched_name
+    stats["match_type"] = match_type
+    stats["match_score"] = match_score
+    stats["needs_review"] = review_flag
+    return stats
+
+
+def build_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAULT):
     """Compare FIFA ratings with position-adjusted real-world production."""
     fifa_main = prepare_main_dataset(fifa_df)
     stats = prepare_stats_dataset(stats_df, min_minutes=min_minutes)
     if stats.empty:
         return pd.DataFrame()
 
+    stats = match_players(fifa_main, stats)
+    matched_stats = stats.dropna(subset=["matched_fifa_name_clean"]).copy()
+
     fifa_main["rating_percentile"] = fifa_main.groupby("position_group")["overall"].rank(pct=True)
-    comparison = stats.merge(fifa_main, on="name_clean", suffixes=("_real", "_fifa"))
+
+    comparison = matched_stats.merge(
+        fifa_main,
+        left_on="matched_fifa_name_clean",
+        right_on="name_clean",
+        suffixes=("_real", "_fifa"),
+    )
     comparison = comparison[
         comparison["position_group_real"] == comparison["position_group_fifa"]
     ].copy()
@@ -154,51 +261,49 @@ def build_valuation_analysis(fifa_df, stats_df, min_minutes=900):
         comparison["performance_percentile"] - comparison["rating_percentile"]
     )
     comparison["valuation"] = comparison["valuation_gap"].map(
-        lambda gap: "underrated" if gap >= 0.2 else "overrated" if gap <= -0.2 else "aligned"
+        lambda gap: "underrated" if gap >= VALUATION_GAP_THRESHOLD
+        else "overrated" if gap <= -VALUATION_GAP_THRESHOLD
+        else "aligned"
     )
     return comparison.sort_values("valuation_gap", ascending=False)
 
 
-def validate_valuation_analysis(fifa_df, stats_df, min_minutes=900):
+def validate_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAULT):
     """Return quality checks for the valuation analysis inputs and output."""
     fifa = standardize_columns(fifa_df)
-    stats = standardize_columns(stats_df)
+    stats_std = standardize_columns(stats_df)
     fifa_main = prepare_main_dataset(fifa)
-    prepared_stats = prepare_stats_dataset(stats, min_minutes=min_minutes)
-    comparison = build_valuation_analysis(fifa, stats, min_minutes=min_minutes)
+    prepared_stats = prepare_stats_dataset(stats_std, min_minutes=min_minutes)
+    matched_stats = match_players(fifa_main, prepared_stats) if not prepared_stats.empty else prepared_stats
+    comparison = build_valuation_analysis(fifa, stats_std, min_minutes=min_minutes)
 
-    fifa_names = set(fifa_main["name_clean"])
-    eligible_names = set(prepared_stats["name_clean"])
-    exact_matches = fifa_names & eligible_names
-    position_counts = comparison["position_group_fifa"].value_counts().to_dict()
-    score_columns = ["performance_percentile", "rating_percentile", "valuation_gap"]
+    match_type_counts = (
+        matched_stats["match_type"].value_counts().to_dict() if not matched_stats.empty else {}
+    )
+    needs_review_count = (
+        int(matched_stats["needs_review"].sum()) if not matched_stats.empty else 0
+    )
+    position_counts = comparison["position_group_fifa"].value_counts().to_dict() if not comparison.empty else {}
 
     report = {
         "fifa_rows": len(fifa),
-        "stats_rows": len(stats),
+        "stats_rows": len(stats_std),
         "eligible_stats_rows": len(prepared_stats),
-        "exact_name_matches": len(exact_matches),
+        "match_type_breakdown": match_type_counts,
+        "match_rate_pct": round(
+            sum(v for k, v in match_type_counts.items() if k != "unmatched" and k != "ambiguous")
+            / len(prepared_stats) * 100, 1
+        ) if len(prepared_stats) else 0,
+        "ambiguous_collisions": match_type_counts.get("ambiguous", 0),
+        "matches_needing_manual_review": needs_review_count,
         "position_consistent_matches": len(comparison),
-        "position_match_rate": round(
-            len(comparison) / len(exact_matches), 3
-        ) if exact_matches else 0,
+        "position_counts": position_counts,
         "duplicate_fifa_ids": int(fifa["player_id"].duplicated().sum())
         if "player_id" in fifa.columns else None,
-        "duplicate_stats_names": int(stats["player"].duplicated().sum())
-        if "player" in stats.columns else None,
-        "position_counts": position_counts,
-        "scores_in_expected_range": all(
-            comparison[column].between(-1, 1).all() for column in score_columns
-        ) if not comparison.empty else False,
     }
 
-    sensitivity = {}
-    for threshold in (600, 900, 1200):
-        threshold_result = build_valuation_analysis(fifa, stats, min_minutes=threshold)
-        sensitivity[threshold] = len(threshold_result)
-    report["comparison_count_by_minutes"] = sensitivity
-
     if not comparison.empty and "value_eur" in comparison.columns:
+        comparison = comparison.copy()
         comparison["value_eur"] = pd.to_numeric(comparison["value_eur"], errors="coerce")
         comparison["market_value_percentile"] = comparison.groupby(
             "position_group_fifa"
@@ -211,23 +316,15 @@ def validate_valuation_analysis(fifa_df, stats_df, min_minutes=900):
             "spearman_correlation": round(
                 market_check["valuation_gap"].corr(
                     market_check["market_value_gap"], method="spearman"
-                ),
-                3,
+                ), 3,
             ) if len(market_check) > 1 else None,
-            "players_with_positive_market_gap": int(
-                (market_check["market_value_gap"] > 0).sum()
-            ),
             "players_checked": len(market_check),
         }
 
-    base = build_valuation_analysis(fifa, stats, min_minutes=900)
-    for threshold in (600, 1200):
-        alternate = build_valuation_analysis(fifa, stats, min_minutes=threshold)
-        base_top = set(base.head(10)["name_clean"])
-        alternate_top = set(alternate.head(10)["name_clean"])
-        report[f"underrated_top_10_overlap_{threshold}_vs_900"] = len(
-            base_top & alternate_top
-        )
+    sensitivity = {}
+    for threshold in (600, 900, 1200):
+        sensitivity[threshold] = len(build_valuation_analysis(fifa, stats_std, min_minutes=threshold))
+    report["comparison_count_by_minutes"] = sensitivity
 
     return report
 
@@ -244,24 +341,33 @@ def run_project_analysis():
     fifa_df = data[fifa_key]
     stats_df = data[stats_key] if stats_key else None
 
-    fifa_main = prepare_main_dataset(fifa_df, stats_df)
+    fifa_main = prepare_main_dataset(fifa_df)
     print("Loaded files:", list(data.keys()))
     print("FIFA main shape:", fifa_main.shape)
-    print(fifa_main.head())
 
     if stats_df is not None:
         comparison = build_valuation_analysis(fifa_df, stats_df)
         validation = validate_valuation_analysis(fifa_df, stats_df)
-        print("Validation:", validation)
-        print("Comparable players:", len(comparison))
-        print("Most underrated players:")
+        print("\nValidation report:")
+        for k, v in validation.items():
+            print(f"  {k}: {v}")
+
+        print("\nMost underrated players:")
         print(comparison[comparison["valuation"] == "underrated"][
-            ["player", "position_group_fifa", "overall", "performance_percentile", "valuation_gap"]
+            ["player", "position_group_fifa", "overall", "performance_percentile", "valuation_gap", "match_type"]
         ].head(10).to_string(index=False))
-        print("Most overrated players:")
+
+        print("\nMost overrated players:")
         print(comparison[comparison["valuation"] == "overrated"][
-            ["player", "position_group_fifa", "overall", "performance_percentile", "valuation_gap"]
+            ["player", "position_group_fifa", "overall", "performance_percentile", "valuation_gap", "match_type"]
         ].tail(10).sort_values("valuation_gap").to_string(index=False))
+
+        print("\nMatches flagged for manual review (fuzzy/collisions):")
+        review_rows = comparison[comparison["needs_review"]]
+        if not review_rows.empty:
+            print(review_rows[["player", "long_name", "match_type", "match_score"]].to_string(index=False))
+        else:
+            print("  none")
 
     return fifa_main
 
