@@ -91,3 +91,22 @@ if available in a future data source.
   defensive stats (see "Known Limitation" below) rather than a bug or
   tuning issue -- tested and ruled out two plausible normalization fixes
   before reaching that conclusion.
+
+  ## Visualizations
+
+Run `python visualize.py` to generate summary charts into `outputs/`:
+
+- **`valuation_vs_market_value.png`** — performance-based valuation_gap vs.
+  independent market value gap, faceted by position. The main chart for
+  seeing whether the model's rankings track an outside signal.
+- **`validation_by_position.png`** — Spearman correlation with two
+  independent targets (`value_eur` and `wage_eur`), grouped by position.
+  Shows the model validates consistently across GK/DEF/MID/FWD, with both
+  targets agreeing directionally.
+- **`valuation_gap_distribution.png`** — box plot of valuation_gap spread
+  by position, showing the distribution is centered near zero for all
+  four groups (the expected signature of a well-calibrated gap metric).
+
+![Valuation vs Market Value](outputs/valuation_vs_market_value.png)
+![Validation by Position](outputs/validation_by_position.png)
+![Valuation Gap Distribution](outputs/valuation_gap_distribution.png)
