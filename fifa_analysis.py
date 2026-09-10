@@ -87,7 +87,7 @@ def prepare_main_dataset(fifa_df):
 
     use_cols = [
         "short_name", "long_name", "age", "overall", "potential", "value_eur",
-        "player_positions", "club_name", "nationality_name", "league_name",
+        "wage_eur", "player_positions", "club_name", "nationality_name", "league_name",
     ]
     use_cols = [c for c in use_cols if c in fifa_df.columns]
 
@@ -255,8 +255,6 @@ def build_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAULT,
     stats = match_players(fifa_main, stats)
     matched_stats = stats.dropna(subset=["matched_fifa_name_clean"]).copy()
 
-    fifa_main["rating_percentile"] = fifa_main.groupby("position_group")["overall"].rank(pct=True)
-
     comparison = matched_stats.merge(
         fifa_main,
         left_on="matched_fifa_name_clean",
@@ -266,6 +264,17 @@ def build_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAULT,
     comparison = comparison[
         comparison["position_group_real"] == comparison["position_group_fifa"]
     ].copy()
+
+    # rating_percentile is computed HERE, within the matched/eligible
+    # population only -- not against the full ~18k-player FIFA dataset.
+    # Ranking against the full dataset (which includes reserves, youth,
+    # and lower-league players who never reach the real-world minutes
+    # threshold) systematically inflates rating_percentile relative to
+    # performance_percentile, since matched players are already an elite,
+    # pre-filtered subset. Both percentiles must be computed on the same
+    # population for valuation_gap to mean anything.
+    comparison["rating_percentile"] = comparison.groupby("position_group_fifa")["overall"].rank(pct=True)
+
     comparison["valuation_gap"] = (
         comparison["performance_percentile"] - comparison["rating_percentile"]
     )
@@ -316,38 +325,42 @@ def validate_valuation_analysis(fifa_df, stats_df, min_minutes=MIN_MINUTES_DEFAU
         if "player_id" in fifa.columns else None,
     }
 
-    if not comparison.empty and "value_eur" in comparison.columns:
-        comparison = comparison.copy()
-        comparison["value_eur"] = pd.to_numeric(comparison["value_eur"], errors="coerce")
-        comparison["market_value_percentile"] = comparison.groupby(
-            "position_group_fifa"
-        )["value_eur"].rank(pct=True)
-        comparison["market_value_gap"] = (
-            comparison["market_value_percentile"] - comparison["rating_percentile"]
-        )
-        market_check = comparison[
-            ["position_group_fifa", "valuation_gap", "market_value_gap"]
-        ].dropna()
-        report["market_value_validation"] = {
-            "spearman_correlation": round(
-                market_check["valuation_gap"].corr(
-                    market_check["market_value_gap"], method="spearman"
-                ), 3,
-            ) if len(market_check) > 1 else None,
-            "players_checked": len(market_check),
-        }
+    def _validate_against_target(comparison_df, target_col):
+        """Correlate valuation_gap against an independent target, overall and by position."""
+        if target_col not in comparison_df.columns:
+            return None
+        df = comparison_df.copy()
+        df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
+        df["target_percentile"] = df.groupby("position_group_fifa")[target_col].rank(pct=True)
+        df["target_gap"] = df["target_percentile"] - df["rating_percentile"]
+        check = df[["position_group_fifa", "valuation_gap", "target_gap"]].dropna()
 
+        overall = {
+            "spearman_correlation": round(
+                check["valuation_gap"].corr(check["target_gap"], method="spearman"), 3,
+            ) if len(check) > 1 else None,
+            "players_checked": len(check),
+        }
         by_position = {}
-        for group, group_df in market_check.groupby("position_group_fifa"):
+        for group, group_df in check.groupby("position_group_fifa"):
             by_position[group] = {
                 "spearman_correlation": round(
-                    group_df["valuation_gap"].corr(
-                        group_df["market_value_gap"], method="spearman"
-                    ), 3,
+                    group_df["valuation_gap"].corr(group_df["target_gap"], method="spearman"), 3,
                 ) if len(group_df) > 1 else None,
                 "players_checked": len(group_df),
             }
-        report["market_value_validation_by_position"] = by_position
+        return {"overall": overall, "by_position": by_position}
+
+    if not comparison.empty:
+        value_validation = _validate_against_target(comparison, "value_eur")
+        if value_validation:
+            report["market_value_validation"] = value_validation["overall"]
+            report["market_value_validation_by_position"] = value_validation["by_position"]
+
+        wage_validation = _validate_against_target(comparison, "wage_eur")
+        if wage_validation:
+            report["wage_validation"] = wage_validation["overall"]
+            report["wage_validation_by_position"] = wage_validation["by_position"]
 
     sensitivity = {}
     for threshold in (600, 900, 1200):
